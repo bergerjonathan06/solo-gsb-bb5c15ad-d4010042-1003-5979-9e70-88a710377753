@@ -22,6 +22,16 @@ Content-Range 闭区间与规划块及对象总长完全一致、响应体字节
 响应混入。通过时按块编号返回可直接提交给 /assemble 的 contents 与确认的
 ETag；任何校验失败均返回带块编号与原因的 422，且不回显响应体。
 
+POST /range-response 接收 /assemble 返回的 object_length、ranges 与对象
+媒体类型，生成可直接下发给客户端下载的 206 Partial Content 响应表示：单段
+时正文即为该段范围字节并附带 Content-Range；多段时按 ranges 下标顺序生成
+multipart/byteranges 正文（每个 part 附 Content-Type 与 Content-Range），
+Content-Type 头携带服务端挑选的 boundary。服务先校验下标恰好覆盖
+0..N-1、区间在对象内、声明长度与区间自洽且 Base64 解码字节数等于声明长度，
+再按最终二进制正文计算 Content-Length，并生成不会与任何正文分隔行冲突的
+boundary；返回 status_code、headers 与 body_b64，生成的 multipart 正文可被
+/multipart-parse 严格解析回各段。
+
 POST /secure-request 是 /plan 与 /assemble 的统一鉴权入口：请求携带
 operation（plan 或 assemble）、payload（即原接口请求体）、key_id、
 timestamp、nonce、signature；服务按固定 JSON 规范化后用环境配置的
@@ -286,6 +296,54 @@ class AssembleResponse(BaseModel):
     ranges: list[AssembledRange] = Field(
         ..., description="按原 ranges 顺序（mappings[].index）排列的重组结果"
     )
+
+
+# ------------------------ /range-response 请求/响应模型 ------------------------
+
+
+# 下发媒体类型的最大长度（含参数），抵御超长输入与头部注入。
+_RANGE_CONTENT_TYPE_MAX_LENGTH = 1000
+
+
+class RangeResponseRequest(BaseModel):
+    """/range-response 请求：/assemble 响应 + 对象媒体类型。
+
+    ranges 直接复用 /assemble 返回的 ranges 元素结构（index/type/start/
+    end/length/data_b64）；content_type 为对象的媒体类型，单段时作为
+    顶层 Content-Type，多段时写入每个 part 的 Content-Type 头。
+    """
+
+    object_length: Annotated[int, StrictInt] = Field(
+        ..., ge=0, description="对象总字节长度（回显 /assemble 的同名值）"
+    )
+    ranges: list[AssembledRange] = Field(
+        ..., min_length=1, description="回显 /assemble 返回的 ranges（1 段或多段）"
+    )
+    content_type: str = Field(
+        ...,
+        min_length=1,
+        max_length=_RANGE_CONTENT_TYPE_MAX_LENGTH,
+        description=(
+            "对象的媒体类型（RFC 7230 type/subtype，可带参数），"
+            "如 application/pdf；多段时写入每个 part 的 Content-Type"
+        ),
+    )
+
+
+class RangeResponseResult(BaseModel):
+    """可直接下发给客户端的 206 Partial Content 响应表示。"""
+
+    status_code: Literal[206] = Field(
+        206, description="HTTP 状态码，固定为 206 Partial Content"
+    )
+    headers: dict[str, str] = Field(
+        ...,
+        description=(
+            "响应头字段：单段含 Content-Type、Content-Range、Content-Length；"
+            "多段含 multipart/byteranges; boundary=... 与 Content-Length"
+        ),
+    )
+    body_b64: str = Field(..., description="响应二进制正文的标准 Base64")
 
 
 # ---------------- /verify-fetch-batch 请求/响应模型 ----------------
@@ -1320,6 +1378,302 @@ def assemble(req: AssembleRequest) -> AssembleResponse:
     return AssembleResponse(object_length=req.object_length, ranges=results)
 
 
+# ----------------------------- /range-response -----------------------------
+
+# 与 /multipart-parse 共用的行内常量（提前定义以便本端点与后续解析器共享）：
+# token（RFC 7230）与 quoted-string 取值、CRLF。
+_TOKEN_RE = re.compile(rb"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_QUOTED_VALUE_RE = re.compile(rb'^(?:[\t\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\t\x20-\x7e])*$')
+_CRLF = b"\r\n"
+
+
+class RangeResponseError(Exception):
+    """206 响应生成阶段的语义校验失败（下标缺失/越界/长度不符/Base64 等）。
+
+    与 AssemblyError 同风格，统一对应 HTTP 422：
+    loc 为可定位的字段路径，例如 "ranges[2].data_b64"；
+    range_index 在可归属到某个 range 时给出。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        loc: str | None = None,
+        *,
+        range_index: int | None = None,
+        code: str = "range_response_error",
+    ):
+        self.message = message
+        self.loc = loc
+        self.range_index = range_index
+        self.code = code
+        super().__init__(message)
+
+
+@app.exception_handler(RangeResponseError)
+async def range_response_error_handler(request: Request, exc: RangeResponseError):
+    detail: dict[str, object] = {"message": exc.message}
+    if exc.loc is not None:
+        detail["loc"] = exc.loc
+    if exc.range_index is not None:
+        detail["range_index"] = exc.range_index
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "detail": [detail]},
+    )
+
+
+# boundary 由固定前缀 + 16 字节随机 hex 组成，长度远小于 RFC 2046 的 70 上限。
+_BOUNDARY_PREFIX = "range-response-"
+_BOUNDARY_RANDOM_BYTES = 16
+# 极小概率（随机性被破坏/正文刻意攻击）下挑选不冲突 boundary 的尝试上限。
+_BOUNDARY_MAX_ATTEMPTS = 100
+
+
+def _validate_media_type(raw: str) -> str:
+    """校验对象媒体类型语法，返回去首尾 OWS 后的原值（不折叠大小写）。
+
+    复用 /multipart-parse 的 Content-Type 语法规则：必须是合法的
+    type/subtype（token "/" token），参数值为 token 或 quoted-string；
+    拒绝空值、非 ASCII、CR/LF 与其他控制字符（头部注入）。
+    """
+    loc = "content_type"
+    if not raw or any(ch in raw for ch in "\r\n"):
+        raise RangeResponseError(
+            "媒体类型为空或包含换行",
+            loc,
+            code="invalid_content_type",
+        )
+    value = raw.strip(" \t")
+    if not value:
+        raise RangeResponseError(
+            "媒体类型为空",
+            loc,
+            code="invalid_content_type",
+        )
+    try:
+        raw_bytes = value.encode("ascii")
+    except UnicodeEncodeError:
+        raise RangeResponseError(
+            "媒体类型必须是 ASCII（非 ASCII 文件名请用 RFC 5987 百分号编码）",
+            loc,
+            code="invalid_content_type",
+        )
+    segments = raw_bytes.split(b";")
+    main_type = segments[0].strip(b" \t")
+    mtype = main_type.split(b"/")
+    if (
+        len(mtype) != 2
+        or not _TOKEN_RE.fullmatch(mtype[0])
+        or not _TOKEN_RE.fullmatch(mtype[1])
+    ):
+        raise RangeResponseError(
+            f"媒体类型 {value!r} 不是合法的 type/subtype",
+            loc,
+            code="invalid_content_type",
+        )
+    for seg in segments[1:]:
+        param = seg.strip(b" \t")
+        if not param or b"=" not in param:
+            raise RangeResponseError(
+                f"媒体类型参数 {seg!r} 非法",
+                loc,
+                code="invalid_content_type",
+            )
+        name, _, pvalue = param.partition(b"=")
+        name = name.strip(b" \t")
+        pvalue = pvalue.strip(b" \t")
+        if not _TOKEN_RE.fullmatch(name):
+            raise RangeResponseError(
+                f"媒体类型参数名 {name!r} 非法",
+                loc,
+                code="invalid_content_type",
+            )
+        if pvalue.startswith(b'"') and pvalue.endswith(b'"'):
+            if len(pvalue) < 2 or not _QUOTED_VALUE_RE.fullmatch(pvalue[1:-1]):
+                raise RangeResponseError(
+                    "媒体类型参数 quoted-string 非法",
+                    loc,
+                    code="invalid_content_type",
+                )
+        elif not _TOKEN_RE.fullmatch(pvalue):
+            raise RangeResponseError(
+                f"媒体类型参数值 {pvalue!r} 非法",
+                loc,
+                code="invalid_content_type",
+            )
+    return value
+
+
+def _decode_b64_range(raw: str, pos: int, index: int) -> bytes:
+    """严格按标准 Base64（含正确填充、validate=True）解码单段内容。"""
+    if len(raw) % 4 != 0:
+        raise RangeResponseError(
+            "Base64 长度不是 4 的倍数，缺少填充或包含非法字符",
+            f"ranges[{pos}].data_b64",
+            range_index=index,
+            code="invalid_base64",
+        )
+    try:
+        return base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RangeResponseError(
+            f"Base64 解码失败：{exc}",
+            f"ranges[{pos}].data_b64",
+            range_index=index,
+            code="invalid_base64",
+        )
+
+
+def _build_multipart_body(
+    segments: list[tuple[int, int, bytes]],
+    media_type: str,
+    object_length: int,
+    boundary: str,
+) -> bytes:
+    """按 ranges 下标顺序构造 multipart/byteranges 正文（严格 CRLF 分帧）。"""
+    delim = b"--" + boundary.encode("ascii")
+    chunks: list[bytes] = []
+    for start, end, data in segments:
+        chunks.append(delim + _CRLF)
+        chunks.append(b"Content-Type: " + media_type.encode("ascii") + _CRLF)
+        chunks.append(
+            f"Content-Range: bytes {start}-{end}/{object_length}".encode("ascii")
+            + _CRLF
+            + _CRLF
+        )
+        chunks.append(data)
+        chunks.append(_CRLF)  # 正文与下一边界行之间的 CRLF（分帧的一部分）
+    chunks.append(delim + b"--")
+    return b"".join(chunks)
+
+
+def _choose_boundary(
+    segments: list[tuple[int, int, bytes]],
+    media_type: str,
+    object_length: int,
+) -> tuple[str, bytes]:
+    """挑选不会与任何 part 正文分隔行冲突的 boundary，并返回生成好的正文。
+
+    每个候选 boundary 都实际拼出最终二进制正文后检查：任何 part 正文中
+    出现 CRLF + "--" + boundary（前置/结束边界）即视为冲突并重试，
+    保证客户端按该 boundary 切分时不会被正文内字节误导。
+    """
+    for _ in range(_BOUNDARY_MAX_ATTEMPTS):
+        boundary = _BOUNDARY_PREFIX + os.urandom(_BOUNDARY_RANDOM_BYTES).hex()
+        marker = _CRLF + b"--" + boundary.encode("ascii")
+        if all(marker not in data for _, _, data in segments):
+            return boundary, _build_multipart_body(
+                segments, media_type, object_length, boundary
+            )
+    raise RuntimeError("无法生成不与正文冲突的 multipart boundary")
+
+
+@app.post("/range-response", response_model=RangeResponseResult)
+def range_response(req: RangeResponseRequest) -> RangeResponseResult:
+    """把 /assemble 的重组结果包装成可直接下发的 206 响应表示。
+
+    先校验下标恰好覆盖 0..N-1、区间在对象内、声明长度与区间自洽且
+    Base64 解码字节数等于声明长度；单段直接输出范围字节，多段按下标
+    顺序生成 multipart/byteranges（boundary 保证不与正文冲突）。
+    Content-Length 一律按最终二进制正文实际长度计算。
+    """
+    media_type = _validate_media_type(req.content_type)
+
+    # 1. 下标必须恰好覆盖 0..N-1（不可重复、缺失或越界），按下标升序排列。
+    index_pos: dict[int, int] = {}
+    for pos, item in enumerate(req.ranges):
+        if item.index < 0:
+            raise RangeResponseError(
+                "范围下标不得为负",
+                f"ranges[{pos}].index",
+                range_index=item.index,
+                code="invalid_range_index",
+            )
+        if item.index in index_pos:
+            raise RangeResponseError(
+                f"范围下标 {item.index} 在 ranges 中重复",
+                f"ranges[{pos}].index",
+                range_index=item.index,
+                code="duplicate_range_index",
+            )
+        index_pos[item.index] = pos
+
+    n = len(req.ranges)
+    if set(index_pos) != set(range(n)):
+        extra = sorted(i for i in index_pos if i >= n)
+        missing_idx = sorted(set(range(n)) - set(index_pos))
+        detail = f"ranges 下标应为 0..{n - 1} 的全排列"
+        if missing_idx:
+            detail += f"，缺少下标 {missing_idx}"
+        if extra:
+            detail += f"，存在多余下标 {extra}"
+        raise RangeResponseError(detail, "ranges", code="invalid_range_index")
+
+    ordered = sorted(req.ranges, key=lambda r: r.index)
+
+    # 2. 逐段校验区间在对象内、声明长度自洽，且 Base64 解码字节数严格相等。
+    segments: list[tuple[int, int, bytes]] = []
+    for item in ordered:
+        pos = index_pos[item.index]
+        if item.end < item.start:
+            raise RangeResponseError(
+                f"范围 [{item.start},{item.end}] 非法：end 不得小于 start",
+                f"ranges[{pos}]",
+                range_index=item.index,
+                code="invalid_range",
+            )
+        if item.end >= req.object_length:
+            raise RangeResponseError(
+                f"范围 [{item.start},{item.end}] 越界："
+                f"对象长度为 {req.object_length}",
+                f"ranges[{pos}]",
+                range_index=item.index,
+                code="range_out_of_bounds",
+            )
+        expected_length = item.end - item.start + 1
+        if item.length != expected_length:
+            raise RangeResponseError(
+                f"范围 {item.index} 声明长度 {item.length} 与区间 "
+                f"[{item.start},{item.end}] 应有的 {expected_length} 字节不符",
+                f"ranges[{pos}].length",
+                range_index=item.index,
+                code="range_length_mismatch",
+            )
+        data = _decode_b64_range(item.data_b64, pos, item.index)
+        if len(data) != item.length:
+            raise RangeResponseError(
+                f"范围 {item.index} 解码后 {len(data)} 字节，"
+                f"与声明长度 {item.length} 不符",
+                f"ranges[{pos}].data_b64",
+                range_index=item.index,
+                code="body_length_mismatch",
+            )
+        segments.append((item.start, item.end, data))
+
+    # 3. 生成最终二进制正文；Content-Length 按实际字节数计算。
+    if n == 1:
+        start, end, data = segments[0]
+        body = data
+        headers = {
+            "Content-Type": media_type,
+            "Content-Range": f"bytes {start}-{end}/{req.object_length}",
+            "Content-Length": str(len(body)),
+        }
+    else:
+        boundary, body = _choose_boundary(segments, media_type, req.object_length)
+        headers = {
+            "Content-Type": f"multipart/byteranges; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        }
+
+    return RangeResponseResult(
+        status_code=206,
+        headers=headers,
+        body_b64=base64.b64encode(body).decode("ascii"),
+    )
+
+
 # --------------------------- /verify-fetch-batch ---------------------------
 
 # RFC 9110 opaque-tag：DQUOTE *etagc DQUOTE。etagc 为 0x21 / 0x23-0x7E /
@@ -1620,13 +1974,8 @@ def verify_fetch_batch(req: VerifyFetchBatchRequest) -> VerifyFetchBatchResponse
 
 # RFC 2046 bcharsnospace：DIGIT / ALPHA / 部分标点（不含空格与 tspecials）。
 _BOUNDARY_RE = re.compile(r"^[0-9A-Za-z'()+_,-./:=?]{1,70}$")
-# token（RFC 7230）：除分隔符与空白、控制字符外的可见 ASCII。
-_TOKEN_RE = re.compile(rb"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
-# quoted-string 取值（不含外层引号）：qdtext（含 tab）或 quoted-pair。
-_QUOTED_VALUE_RE = re.compile(rb'^(?:[\t\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\t\x20-\x7e])*$')
 # Content-Range: bytes <start>-<end>/<total>（仅数字 total，不接受 *）。
 _CONTENT_RANGE_RE = re.compile(rb"^bytes[ \t]+(\d+)-(\d+)/(\d+)$")
-_CRLF = b"\r\n"
 _BLANK_CRLF = b"\r\n\r\n"
 
 # 每个 part 允许出现的头部（全部小写）；任何其他头部都按头部注入拒绝。

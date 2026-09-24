@@ -32,6 +32,14 @@
   `filename*`（支持 UTF-8 / ISO-8859-1 百分号编码），无效或缺失时回退到传统
   `filename`；解码后剥离路径前缀（`/` 与 `\`）、控制字符及尾部点/空格，空名与
   `.` / `..` 等危险名称一律拒绝，无法得到有效名称时返回 `422`。
+- `POST /range-response`：接收 `/assemble` 返回的 `object_length`、`ranges`
+  与对象媒体类型，生成可直接下发给客户端下载的 **`206 Partial Content`
+  响应表示**。单段时正文即范围字节并附 `Content-Range`；多段时按 `ranges`
+  下标顺序生成 `multipart/byteranges`（每段附 `Content-Type` 与
+  `Content-Range`），boundary 保证不与任何正文分隔行冲突；`Content-Length`
+  按最终二进制正文精确计算。返回 `status_code`、`headers` 与 `body_b64`，
+  下标不覆盖 `0..N-1`、区间越界、长度不符、Base64 非法或媒体类型非法均返回
+  可定位的 `422`。
 
 ## Docker 一键启动
 
@@ -44,6 +52,23 @@ docker compose up --build -d
 - 访问地址：http://127.0.0.1:8080 （仅绑定本机回环地址）
 - 接口文档（Swagger UI）：http://127.0.0.1:8080/docs
 - 健康检查：`curl http://127.0.0.1:8080/healthz` → `{"status":"ok"}`
+
+8080 端口调用示例（启动后可直接执行）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/range-response \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "object_length": 16,
+    "ranges": [
+      {"index": 0, "type": "interval", "start": 2, "end": 6,
+       "length": 5, "data_b64": "AgQFBgc="}
+    ],
+    "content_type": "application/octet-stream"
+  }'
+# {"status_code":206,"headers":{"Content-Type":"application/octet-stream",
+#  "Content-Range":"bytes 2-6/16","Content-Length":"5"},"body_b64":"AgQFBgc="}
+```
 
 查看日志与停止：
 
@@ -262,6 +287,107 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 `cached_blocks` 的字节并做 Base64 编码；最后连同 `blocks`、`mappings`、
 `cached_blocks` 一起提交给 `/assemble`，即可取回与原请求 ranges 一一对应
 的字节内容。
+
+### `POST /range-response`
+
+`/assemble` 返回的是按段拆分的 Base64 内容；本端点把它进一步包装成代理可
+**原样转发给客户端下载**的 `206 Partial Content` 响应表示（状态码 + 响应头
++ 二进制正文）。请求直接回显 `/assemble` 的返回并补充对象媒体类型：
+
+| 字段 | 说明 |
+| --- | --- |
+| `object_length` | 对象总字节长度（回显 `/assemble` 的同名值） |
+| `ranges` | 回显 `/assemble` 返回的 `ranges`（1–N 段，元素含 `index`/`type`/`start`/`end`/`length`/`data_b64`） |
+| `content_type` | 对象的媒体类型（合法 `type/subtype`，可带参数），如 `application/pdf`；多段时写入每个 part |
+
+单段请求示例：
+
+```json
+{
+  "object_length": 256,
+  "ranges": [
+    {
+      "index": 0,
+      "type": "interval",
+      "start": 0,
+      "end": 99,
+      "length": 100,
+      "data_b64": "AAECAw..."
+    }
+  ],
+  "content_type": "application/pdf"
+}
+```
+
+单段时服务直接以该段字节为正文（不做任何分帧），响应头为
+`Content-Type`（传入的对象媒体类型）、`Content-Range: bytes start-end/total`
+与按实际字节数计算的 `Content-Length`：
+
+```json
+{
+  "status_code": 206,
+  "headers": {
+    "Content-Type": "application/pdf",
+    "Content-Range": "bytes 0-99/256",
+    "Content-Length": "100"
+  },
+  "body_b64": "AAECAw..."
+}
+```
+
+多段（如 `bytes=0-99` 与末尾 16 字节）时按 `ranges` 下标**升序**生成
+`multipart/byteranges` 正文：每个 part 附 `Content-Type`（对象媒体类型）与
+`Content-Range: bytes start-end/total`，严格 CRLF 分帧。顶层 `Content-Type`
+为 `multipart/byteranges; boundary=...`，**没有**顶层 `Content-Range`；
+boundary 由服务端随机生成并确保不与任何 part 正文中的字节序列冲突
+（正文内嵌 `CRLF--boundary` 形态字节时自动换一个）：
+
+```json
+{
+  "status_code": 206,
+  "headers": {
+    "Content-Type": "multipart/byteranges; boundary=range-response-05e4d23dcc8e20b092d450280a9ac8fa",
+    "Content-Length": "422"
+  },
+  "body_b64": "LS1yYW5nZS1yZXNwb25zZS0..."
+}
+```
+
+生成的 multipart 正文与上游风格完全一致，可用 `/multipart-parse` 严格解析
+回各段（往返一致）。`body_b64` 始终是最终二进制正文（含 multipart 分帧字节）
+的标准 Base64；`Content-Length` 是该最终正文的真实字节数，客户端可直接
+信任。调用方只需把 `status_code`、`headers`、`body_b64` 解码后的字节分别
+作为下游 HTTP 响应的状态行、头与正文写出即可。
+
+#### 校验规则
+
+以下任一不满足都返回 `422`（错误结构与 `/assemble` 一致，`detail[0]` 带
+`loc` 与 `range_index`）：
+
+1. `ranges[].index` 必须非负、不重复，且**恰好覆盖 `0..N-1`**（输入可乱序，
+   输出始终按下标升序）——`duplicate_range_index` / `invalid_range_index`；
+2. 每段 `start <= end` 且 `end < object_length`——
+   `invalid_range` / `range_out_of_bounds`；
+3. 每段声明的 `length` 必须等于 `end - start + 1`——`range_length_mismatch`；
+4. `data_b64` 必须是含正确填充的标准 Base64，解码字节数必须**严格等于**
+   `length`——`invalid_base64` / `body_length_mismatch`；
+5. `content_type` 必须是合法的 ASCII `type/subtype`（参数值支持 token 或
+   quoted-string），拒绝空值、CR/LF 折行、非 ASCII 与非法参数（头部注入）
+   ——`invalid_content_type`；合法时去首尾空白后**原样**保留大小写与参数
+   （如 `text/plain; charset="utf-8"`）。
+
+字段缺失、`ranges` 为空、`content_type` 超长等模型级错误返回
+`422 invalid_request`。
+
+仅依赖标准库、走完整 `/plan → 模拟上游 206 → /verify-fetch-batch →
+/assemble → /range-response` 链路并逐字节核对（多段还会与
+`/multipart-parse` 交叉验证）的示例见
+[`examples/range_response_example.py`](examples/range_response_example.py)：
+
+```
+python examples/range_response_example.py              # 单段
+python examples/range_response_example.py --multipart  # 多段
+```
 
 ### `POST /verify-fetch-batch`
 
@@ -750,6 +876,20 @@ quoted-string、disposition type 缺失等）返回
   | `block_out_of_bounds`       | 回源块超出对象长度                 |
   | `duplicate_mapping_index`   | mappings 中下标重复                |
   | `invalid_mapping_index`     | mappings 下标未覆盖 0..N-1         |
+- `/range-response` 的响应生成错误采用同一结构：`detail[0]` 携带 `loc`
+  （如 `ranges[2].data_b64`、`content_type`）与可归属的 `range_index`；
+  主要错误码：
+
+  | error                       | 含义                               |
+  | --------------------------- | ---------------------------------- |
+  | `invalid_range_index`       | ranges 下标为负、重复或未恰好覆盖 0..N-1 |
+  | `duplicate_range_index`     | ranges 中出现重复下标              |
+  | `invalid_range`             | 范围 `end < start`                 |
+  | `range_out_of_bounds`       | 范围超出对象长度（`end >= object_length`） |
+  | `range_length_mismatch`     | 声明长度与区间应有的字节数不符     |
+  | `invalid_base64`            | Base64 非法或填充错误              |
+  | `body_length_mismatch`      | 解码字节数与声明长度不符           |
+  | `invalid_content_type`      | 媒体类型不是合法 type/subtype 或含注入字符 |
 
 `/secure-request` 的鉴权类错误（均为 `{"error": ..., "message": ...}`）：
 
