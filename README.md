@@ -9,6 +9,13 @@
 - `POST /assemble`：回显 `/plan` 的 `blocks`、`mappings`（以及 `cached_blocks`），
   并分别按块提供 Base64 回源内容与缓存内容；服务严格校验来源 id、边界、缺块
   与重复块后，依据切片映射按原 ranges 顺序重组，返回每段范围的 Base64 内容与长度。
+- `POST /range-response`：接收 `/assemble` 返回的 `object_length`、`ranges` 与
+  媒体类型，生成可供客户端直接下载的 `206 Partial Content` 响应表示。单段直接
+  输出范围字节并附 `Content-Type`、`Content-Length`、`Content-Range`；多段按
+  ranges 下标顺序生成严格 CRLF 分帧的 `multipart/byteranges`，每段附
+  `Content-Type` 与 `Content-Range`。服务先校验下标恰好覆盖 `0..N-1`、区间在
+  对象内且每段 Base64 解码字节数等于声明长度；`Content-Length` 按最终二进制
+  正文计算，boundary 随机生成且不会与正文分隔行冲突。
 - `POST /verify-fetch-batch`：校验按 `/plan` 的 `blocks` 逐块回源得到的上游
   `206` 响应。接收 `blocks`、`object_length` 与按块编号提供的上游状态码、
   `Content-Range`、ETag、Base64 响应体；只接受闭区间与规划块及对象总长完全
@@ -63,7 +70,8 @@ docker run --rm -p 127.0.0.1:8080:8080 range-planner:latest
 
 ## 配置
 
-`/plan` 与 `/assemble` 无需任何配置。`/secure-request` 通过以下环境变量配置：
+`/plan`、`/assemble`、`/range-response` 与本服务其余端点均无需任何配置。
+`/secure-request` 通过以下环境变量配置：
 
 | 环境变量 | 必需 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -71,9 +79,10 @@ docker run --rm -p 127.0.0.1:8080:8080 range-planner:latest
 | `SECURE_REQUEST_TIMESTAMP_SKEW` | 否 | `300` | 请求 `timestamp` 与服务端时间允许的最大偏差（秒） |
 | `SECURE_REQUEST_NONCE_TTL` | 否 | `600`（2 倍偏差） | 同一 `key_id+nonce` 的防重放保留窗口（秒），应不小于时间偏差 |
 
-未设置 `SECURE_REQUEST_KEYS`（或为空）时，`/plan`、`/assemble` 仍正常工作，
-但 `/secure-request` 返回 `503 keys_not_configured`。密钥配置格式非法（启动时
-解析失败）会导致服务直接启动失败，避免带错误配置上线。
+未设置 `SECURE_REQUEST_KEYS`（或为空）时，`/plan`、`/assemble`、
+`/range-response` 等端点仍正常工作，但 `/secure-request` 返回
+`503 keys_not_configured`。密钥配置格式非法（启动时解析失败）会导致服务
+直接启动失败，避免带错误配置上线。
 
 可复制 `.env.example` 为 `.env` 后修改；`docker compose` 会自动读取同目录
 `.env`。也可以直接用 `-e` 注入：
@@ -262,6 +271,129 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 `cached_blocks` 的字节并做 Base64 编码；最后连同 `blocks`、`mappings`、
 `cached_blocks` 一起提交给 `/assemble`，即可取回与原请求 ranges 一一对应
 的字节内容。
+
+### `POST /range-response`
+
+拿到 `/assemble` 的重组结果后，用本端点生成**可直接下发给下载客户端的
+206 Partial Content 响应表示**（状态码、头字段与二进制正文）。本端点不需要
+任何环境变量配置。
+
+请求字段（`ranges` 可把 `/assemble` 响应中的同名数组原样回显）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `object_length` | 对象总字节长度（回显 `/assemble` 的同名值） |
+| `ranges` | `/assemble` 返回的范围列表（`index/type/start/end/length/data_b64`），至少 1 段 |
+| `content_type` | 对象媒体类型，形如 `type/subtype`，可带参数（如 `text/plain; charset=utf-8`）；将原样写入单段响应或每个 multipart part 的 `Content-Type` |
+
+服务先执行严格校验（任一不满足返回 `422`，且不回显 `data_b64`）：
+
+1. `ranges[].index` 非负、不重复，且**恰好覆盖 `0..N-1`**（缺号、越号、
+   乱序输入允许但输出按下标排序）；
+2. 每个区间 `start <= end`、`0 <= start` 且 `end < object_length`，
+   `length == end - start + 1`；
+3. `data_b64` 必须是含正确填充的标准 Base64（`validate=True`，拒绝
+   URL-safe 字母表与夹杂空白），**解码字节数必须等于声明长度**；
+4. `content_type` 必须是合法 RFC 9110 媒体类型（参数值支持 token 或
+   quoted-string），拒绝空值、非 ASCII 与 CR/LF（防止响应头注入）。
+
+#### 单段：直接输出范围字节
+
+只有一段时，正文就是该段的范围字节，响应头包含 `Content-Type`、
+`Content-Length` 与 `Content-Range: bytes start-end/total`，
+`media_type` 为 `"single"`、`boundary` 为 `null`：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/range-response \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "object_length": 11,
+    "content_type": "text/plain; charset=utf-8",
+    "ranges": [
+      {"index": 0, "type": "interval", "start": 0, "end": 4,
+       "length": 5, "data_b64": "aGVsbG8="}
+    ]
+  }'
+```
+
+```json
+{
+  "status_code": 206,
+  "headers": {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Content-Length": "5",
+    "Content-Range": "bytes 0-4/11"
+  },
+  "content_length": 5,
+  "media_type": "single",
+  "boundary": null,
+  "body_b64": "aGVsbG8="
+}
+```
+
+#### 多段：按 ranges 下标顺序生成 multipart/byteranges
+
+多段时生成 RFC 2046 风格、严格 CRLF 分帧的 `multipart/byteranges`
+完整正文：以 `--boundary` 开头、`--boundary--` 收尾（无任何前导/拖尾
+字节），每个 part 恰好携带 `Content-Type` 与
+`Content-Range: bytes start-end/total` 两个头。`boundary` 每次随机
+（`range-response-` 前缀 + 24 个十六进制字符），服务会保证它不与任何
+正文分隔行冲突；`Content-Length` 是**最终二进制正文**（含边界行与 part
+头）的真实字节数：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/range-response \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "object_length": 11,
+    "content_type": "text/plain; charset=utf-8",
+    "ranges": [
+      {"index": 0, "type": "interval", "start": 0, "end": 4,
+       "length": 5, "data_b64": "aGVsbG8="},
+      {"index": 1, "type": "interval", "start": 6, "end": 10,
+       "length": 5, "data_b64": "d29ybGQ="}
+    ]
+  }'
+```
+
+```json
+{
+  "status_code": 206,
+  "headers": {
+    "Content-Type": "multipart/byteranges; boundary=range-response-83af89f8eaacb5c0d53c5724",
+    "Content-Length": "288"
+  },
+  "content_length": 288,
+  "media_type": "multipart/byteranges",
+  "boundary": "range-response-83af89f8eaacb5c0d53c5724",
+  "body_b64": "LS1yYW5nZS1yZXNwb25zZS04M2FmODlmOGVhYWNiNWMwZDUzYzU3MjQNCkNvbnRlbnQtVHlwZTogdGV4dC9wbGFpbjsgY2hhcnNldD11dGYtOA0KQ29udGVudC1SYW5nZTogYnl0ZXMgMC00LzExDQoNCmhlbGxvDQotLXJhbmdlLXJlc3BvbnNlLTgzYWY4OWY4ZWFhY2I1YzBkNTNjNTcyNA0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluOyBjaGFyc2V0PXV0Zi04DQpDb250ZW50LVJhbmdlOiBieXRlcyA2LTEwLzExDQoNCndvcmxkDQotLXJhbmdlLXJlc3BvbnNlLTgzYWY4OWY4ZWFhY2I1YzBkNTNjNTcyNC0t"
+}
+```
+
+客户端只需把 `status_code`、`headers` 与 `body_b64` 解码出的字节原样
+写入下载响应即可。`body_b64` 的分帧与 [`POST /multipart-parse`
+](#post-multipart-parse) 接受的格式完全一致——可回交给该端点做逐字节
+核对。完整流程（/plan → 模拟 206 回源 → /assemble → /range-response →
+/multipart-parse 往返验证）见
+[`examples/range_response_example.py`](examples/range_response_example.py)：
+
+```
+python examples/range_response_example.py
+```
+
+主要错误码（错误体统一为
+`{"error": "<code>", "detail": [{"message": ..., "loc": ..., "range_index": ...}]}`）：
+
+| error | 含义 |
+| --- | --- |
+| `invalid_range_index` | 下标为负、重复或未恰好覆盖 0..N-1 |
+| `duplicate_range_index` | 相同范围下标在 ranges 中重复 |
+| `invalid_range` | 区间非法（end 小于 start） |
+| `range_out_of_bounds` | 区间超出对象边界 |
+| `range_length_mismatch` | 声明长度与区间应有的字节数不符 |
+| `invalid_base64` | `data_b64` 非法 Base64 或填充错误 |
+| `body_length_mismatch` | Base64 解码字节数与声明长度不符 |
+| `invalid_content_type` | `content_type` 不是合法媒体类型（含 CR/LF 注入、非 ASCII 等） |
 
 ### `POST /verify-fetch-batch`
 
@@ -751,6 +883,11 @@ quoted-string、disposition type 缺失等）返回
   | `duplicate_mapping_index`   | mappings 中下标重复                |
   | `invalid_mapping_index`     | mappings 下标未覆盖 0..N-1         |
 
+- `/range-response` 的响应生成错误采用同一结构：`detail[0]` 携带 `loc`
+  （如 `ranges[2].data_b64`、`content_type`）与可归属的 `range_index`，
+  错误响应**绝不回显**任何 `data_b64`；错误码与含义见
+  [`POST /range-response`](#post-range-response) 一节。
+
 `/secure-request` 的鉴权类错误（均为 `{"error": ..., "message": ...}`）：
 
 | HTTP | error                 | 含义                                              |
@@ -768,9 +905,12 @@ quoted-string、disposition type 缺失等）返回
 
 ```
 pip install -r requirements.txt
-export SECURE_REQUEST_KEYS='demo-key=0123456789abcdef0123456789abcdef'
 uvicorn app.main:app --reload --port 8080
 ```
+
+仅在需要调试 `/secure-request` 时才需导出密钥环境变量（例如
+`export SECURE_REQUEST_KEYS='demo-key=0123456789abcdef0123456789abcdef'`）；
+`/plan`、`/assemble`、`/range-response` 等端点无需任何配置。
 
 运行测试（`TestClient` 随 `fastapi` 安装的 `starlette` 提供）：
 
